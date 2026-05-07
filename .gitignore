@@ -1,0 +1,8 @@
+.git
+models/
+.gitattribute
+profiles.json
+settings.json
+logs/
+bin/
+__pycache__/
