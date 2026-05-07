@@ -6,3 +6,4 @@ settings.json
 logs/
 bin/
 __pycache__/
+.idea/
