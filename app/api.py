@@ -1,62 +1,157 @@
-# api.py v2.4 ── FastAPI REST 端點
+# api.py v2.6 ── FastAPI REST 端點
 from __future__ import annotations
 import os, time, json, uuid, threading
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 
+import logging
 import config
 import engine as eng
 
-app = FastAPI(title="LlamaGUI API", version="2.4.0")
+app = FastAPI(title="LlamaGUI API", version="2.6.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
-# ── Pydantic models ───────────────────────────────────────────────────────────
+# ── Logger 設定 ───────────────────────────────────────────────────────────────
+_log_path = config.ROOT / "logs" / "api.log"
+_log_path.parent.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(str(_log_path), encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger("llamagui.api")
+
+# ── 全域 exception handler ────────────────────────────────────────────────────
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    import traceback
+    tb = traceback.format_exc()
+    logger.error(
+        f"Unhandled exception\n"
+        f"  Path:  {request.method} {request.url}\n"
+        f"  Error: {type(exc).__name__}: {exc}\n"
+        f"  Trace:\n{tb}"
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"{type(exc).__name__}: {exc}"}
+    )
+
+# ── Request log middleware ────────────────────────────────────────────────────
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    import time as _time
+    start    = _time.time()
+    response = await call_next(request)
+    elapsed  = (_time.time() - start) * 1000
+    level    = logging.WARNING if response.status_code >= 400 else logging.INFO
+    logger.log(level,
+               f"{request.method} {request.url.path} "
+               f"→ {response.status_code} ({elapsed:.1f}ms)")
+    return response
+
+# ── DD-011: Pydantic ContentPart 型別宣告 ─────────────────────────────────────
+class ImageURL(BaseModel):
+    url:    str
+    detail: Literal["auto", "low", "high"] = "auto"
+
+class ContentPartText(BaseModel):
+    type: Literal["text"]
+    text: str
+
+class ContentPartImage(BaseModel):
+    type:      Literal["image_url"]
+    image_url: ImageURL
+
 class Message(BaseModel):
     role:    str
-    content: Any
+    # content 支援純文字或多模態 parts（OpenAI content parts 格式）
+    content: str | list[ContentPartText | ContentPartImage]
 
+    def to_dict(self) -> dict:
+        """序列化為 engine 可用的 dict，list content 轉為可 JSON 化的 dict list。"""
+        if isinstance(self.content, str):
+            return {"role": self.role, "content": self.content}
+        return {
+            "role": self.role,
+            "content": [p.model_dump(exclude_none=True) for p in self.content],
+        }
+
+    def has_images(self) -> bool:
+        if isinstance(self.content, list):
+            return any(p.type == "image_url" for p in self.content)
+        return False
+
+# ── 其他 Pydantic models ──────────────────────────────────────────────────────
 class ResponseFormat(BaseModel):
-    type:        str = "text"
+    type:        str       = "text"
     json_schema: dict | None = None
 
 class ChatRequest(BaseModel):
-    model:           str   = "local"
-    messages:        list[Message]
-    temperature:     float = Field(default=0.7,  ge=0.0, le=2.0)
-    top_p:           float = Field(default=0.9,  ge=0.0, le=1.0)
-    top_k:           int   = Field(default=40,   ge=1)
-    repeat_penalty:  float = Field(default=1.1,  ge=0.0)
-    max_tokens:      int   = Field(default=2048, ge=1)
-    stream:          bool  = False
+    model:    str = "local"
+    messages: list[Message]
+    temperature:    float = Field(default=0.7, ge=0.0, le=2.0)
+    top_p:          float = Field(default=0.9, ge=0.0, le=1.0)
+    top_k:          int   = Field(default=40,  ge=1)
+    repeat_penalty: float = Field(default=1.1, ge=0.0)
+    max_tokens:     int   = Field(default=2048, ge=1)
+    stream:         bool  = False
     response_format: ResponseFormat | None = None
+    # DD-007
+    stop:              list[str] | str | None = None
+    seed:              int | None             = None
+    presence_penalty:  float | None          = None
+    frequency_penalty: float | None          = None
+    logprobs:          bool | None           = None
+    top_logprobs:      int | None            = None
+    # DD-008
+    tools:       list[dict] | None       = None
+    tool_choice: str | dict | None       = None
+    # DD-002
+    id_slot:     int | None              = None
+
+class CompletionRequest(BaseModel):
+    model:      str              = "local"
+    prompt:     str | list[str]
+    max_tokens: int              = Field(default=256, ge=1)
+    temperature: float           = Field(default=0.7, ge=0.0, le=2.0)
+    top_p:       float           = Field(default=0.9, ge=0.0, le=1.0)
+    top_k:       int             = Field(default=40,  ge=1)
+    stop:        list[str] | str | None = None
+    seed:        int | None      = None
+    stream:      bool            = False
+    echo:        bool            = False
 
 class EmbeddingRequest(BaseModel):
     model: str = "local"
     input: str | list[str]
 
 class LoadRequest(BaseModel):
-    profile_name:   str   | None = None
-    model_path:     str   | None = None
-    # 硬體參數：有填才覆蓋 profile 預設值
-    n_ctx:          int   | None = None
-    n_gpu_layers:   int   | None = None
-    n_batch:        int   | None = None
-    n_threads:      int   | None = None
-    # 推論參數（存進 profile 作為 session 預設）
+    profile_name: str | None = None
+    model_path:   str | None = None
+    n_ctx:        int | None = None
+    n_gpu_layers: int | None = None
+    n_batch:      int | None = None
+    n_threads:    int | None = None
     temperature:    float | None = None
     top_p:          float | None = None
-    top_k:          int   | None = None
+    top_k:          int | None   = None
     repeat_penalty: float | None = None
-    max_tokens:     int   | None = None
-    chat_format:    str   | None = None
-    engine_mode:    str   | None = None   # "subprocess" | "binding"
+    max_tokens:     int | None   = None
+    chat_format:    str | None   = None
+    engine_mode:    str | None   = None
+    draft_model_path: str | None = None  # DD-001
 
 class ProfileSaveRequest(BaseModel):
     name:    str
@@ -73,13 +168,32 @@ class HFDownloadRequest(BaseModel):
 
 _download_tasks: dict[str, dict] = {}
 
+# ── DD-011: vision guard helper ───────────────────────────────────────────────
+def _check_vision_request(req: ChatRequest) -> None:
+    """
+    如果任何 message 含有 image_url part，檢查當前模型是否具備視覺能力。
+    若不支援，直接 raise HTTPException 400，不讓請求流到 llama-server。
+    """
+    has_image = any(m.has_images() for m in req.messages)
+    if has_image and not eng.engine.has_vision:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "model does not support vision — "
+                "load a multimodal model with mmproj "
+                "(e.g. Gemma3-VL, Qwen2-VL, LLaVA). "
+                f"Current model: '{eng.engine.stats.model_name}'"
+            )
+        )
+
 # ═════════════════════════════════════════════════════════════════════════════
 # 基本端點
 # ═════════════════════════════════════════════════════════════════════════════
 @app.get("/health")
 def health():
     return {"status": "ok", "model_loaded": eng.engine.is_loaded,
-            "model_name": eng.engine.stats.model_name}
+            "model_name": eng.engine.stats.model_name,
+            "has_vision": eng.engine.has_vision}   # DD-011
 
 @app.get("/models")
 def list_models():
@@ -94,10 +208,8 @@ def list_models_openai():
     return {
         "object": "list",
         "data": [
-            {"id":       os.path.splitext(os.path.basename(f))[0],
-             "object":   "model",
-             "created":  now,
-             "owned_by": "local"}
+            {"id": os.path.splitext(os.path.basename(f))[0],
+             "object": "model", "created": now, "owned_by": "local"}
             for f in files
         ],
     }
@@ -108,7 +220,6 @@ def load_model(req: LoadRequest):
 
     if req.model_path:
         path = req.model_path
-        # 若傳入的不是有效絕對路徑，嘗試當作 model name 做模糊解析
         if not os.path.isfile(path):
             resolved = eng._find_model_by_name(path)
             if resolved:
@@ -118,23 +229,17 @@ def load_model(req: LoadRequest):
                     status_code=404,
                     detail=f"Model not found: '{req.model_path}'. "
                            f"Pass an absolute path or a name matching a .gguf in models/. "
-                           f"Use GET /v1/models to list available models."
-                )
+                           f"Use GET /v1/models to list available models.")
         profile["model_path"] = path
-        
-    # 有填才覆蓋，None 表示沿用 profile 原始值
+
     overrides = {
-        "n_ctx":          req.n_ctx,
-        "n_gpu_layers":   req.n_gpu_layers,
-        "n_batch":        req.n_batch,
-        "n_threads":      req.n_threads,
-        "temperature":    req.temperature,
-        "top_p":          req.top_p,
-        "top_k":          req.top_k,
-        "repeat_penalty": req.repeat_penalty,
-        "max_tokens":     req.max_tokens,
-        "chat_format":    req.chat_format,
-        "engine_mode":    req.engine_mode,
+        "n_ctx": req.n_ctx, "n_gpu_layers": req.n_gpu_layers,
+        "n_batch": req.n_batch, "n_threads": req.n_threads,
+        "temperature": req.temperature, "top_p": req.top_p,
+        "top_k": req.top_k, "repeat_penalty": req.repeat_penalty,
+        "max_tokens": req.max_tokens, "chat_format": req.chat_format,
+        "engine_mode": req.engine_mode,
+        "draft_model_path": req.draft_model_path,
     }
     for k, v in overrides.items():
         if v is not None:
@@ -143,7 +248,7 @@ def load_model(req: LoadRequest):
     ok, msg = eng.engine.load(profile)
     if not ok:
         raise HTTPException(status_code=400, detail=msg)
-    return {"status": "loaded", "message": msg}
+    return {"status": "loaded", "message": msg, "has_vision": eng.engine.has_vision}
 
 @app.post("/unload")
 def unload_model():
@@ -280,7 +385,10 @@ async def chat_completions(req: ChatRequest):
     elif not eng.engine.is_loaded:
         raise HTTPException(status_code=503, detail="No model loaded. POST /load first.")
 
-    profile_override = {
+    # DD-011: vision guard — fail-fast before hitting llama-server
+    _check_vision_request(req)
+
+    profile_override: dict[str, Any] = {
         **eng.engine.current_profile,
         "temperature":    req.temperature,
         "top_p":          req.top_p,
@@ -288,7 +396,18 @@ async def chat_completions(req: ChatRequest):
         "repeat_penalty": req.repeat_penalty,
         "max_tokens":     req.max_tokens,
     }
-    messages      = [{"role": m.role, "content": m.content} for m in req.messages]
+    for field in ("stop", "seed", "presence_penalty", "frequency_penalty",
+                  "logprobs", "top_logprobs"):
+        val = getattr(req, field)
+        if val is not None:
+            profile_override[field] = val
+    if req.tools       is not None: profile_override["tools"]       = req.tools
+    if req.tool_choice is not None: profile_override["tool_choice"] = req.tool_choice
+    if req.id_slot is not None: profile_override["id_slot"] = req.id_slot
+
+    # DD-011: serialise messages with full ContentPart support
+    messages = [m.to_dict() for m in req.messages]
+
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
     rf_dict: dict | None = None
     if req.response_format:
@@ -315,6 +434,8 @@ async def chat_completions(req: ChatRequest):
         full = eng.engine.generate(messages, profile_override, rf_dict)
     except TimeoutError as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
     stats = eng.engine.get_stats()
     return {"id": completion_id, "object": "chat.completion",
             "created": int(time.time()), "model": req.model,
@@ -324,6 +445,75 @@ async def chat_completions(req: ChatRequest):
             "usage": {"prompt_tokens":     stats.get("prompt_tokens", 0),
                       "completion_tokens": stats.get("completion_tokens", 0),
                       "total_tokens":      stats.get("prompt_tokens", 0) + stats.get("completion_tokens", 0)}}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DD-003: OpenAI-compatible text completions (non-chat)
+# ═════════════════════════════════════════════════════════════════════════════
+@app.post("/v1/completions")
+async def text_completions(req: CompletionRequest):
+    if req.model and req.model != "local":
+        ok, msg = eng.engine.ensure_model_loaded(req.model)
+        if not ok:
+            raise HTTPException(status_code=404 if "not found" in msg else 503, detail=msg)
+    elif not eng.engine.is_loaded:
+        raise HTTPException(status_code=503, detail="No model loaded. POST /load first.")
+
+    prompts       = [req.prompt] if isinstance(req.prompt, str) else req.prompt
+    completion_id = f"cmpl-{uuid.uuid4().hex[:8]}"
+
+    if eng.engine.active is eng.engine.sub:
+        import urllib.request as _ur
+        body: dict[str, Any] = {
+            "model":       "local",
+            "prompt":      req.prompt,
+            "max_tokens":  req.max_tokens,
+            "temperature": req.temperature,
+            "top_p":       req.top_p,
+            "top_k":       req.top_k,
+            "stream":      req.stream,
+            "echo":        req.echo,
+        }
+        if req.stop is not None: body["stop"] = req.stop
+        if req.seed is not None: body["seed"] = req.seed
+        payload  = json.dumps(body).encode()
+        url      = eng.engine.sub._server_url("/v1/completions")
+        http_req = _ur.Request(url, data=payload,
+                               headers={"Content-Type": "application/json"}, method="POST")
+        if req.stream:
+            async def _proxy_stream() -> AsyncIterator[str]:
+                try:
+                    with _ur.urlopen(http_req, timeout=300) as resp:
+                        for raw in resp:
+                            yield raw.decode("utf-8")
+                except Exception as e:
+                    yield f"data: {{\"error\": \"{e}\"}}\n\n"
+                    yield "data: [DONE]\n\n"
+            return StreamingResponse(_proxy_stream(), media_type="text/event-stream")
+        try:
+            with _ur.urlopen(http_req, timeout=300) as resp:
+                return json.loads(resp.read())
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    results = []
+    for i, p_text in enumerate(prompts):
+        kwargs: dict[str, Any] = dict(
+            prompt=p_text, max_tokens=req.max_tokens,
+            temperature=req.temperature, top_p=req.top_p,
+            top_k=req.top_k, echo=req.echo, stream=False,
+        )
+        if req.stop is not None: kwargs["stop"] = req.stop
+        if req.seed is not None: kwargs["seed"] = req.seed
+        try:
+            res = eng.engine.bind.llm.create_completion(**kwargs)
+            results.append({"index": i, "text": res["choices"][0]["text"],
+                             "finish_reason": res["choices"][0].get("finish_reason", "stop")})
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    return {"id": completion_id, "object": "text_completion",
+            "created": int(time.time()), "model": req.model,
+            "choices": results,
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
 
 # ═════════════════════════════════════════════════════════════════════════════
 # OpenAI-compatible embeddings
