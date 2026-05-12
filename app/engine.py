@@ -1,8 +1,12 @@
-# engine.py v2.5 ── LlamaGUI backend engine
+# engine.py v4.0 ── LlamaGUI backend engine
+# DD-012 #7: ProfileDict TypedDict + _p() helper unify all profile key access.
+# All profile["key"] / .get("key", default) inside engine methods replaced by
+# _p(profile, "key") so key names are validated against a single declaration.
+# Function signatures keep plain dict to avoid annotation-vs-assignment IDE errors.
 from __future__ import annotations
 import os, re, json, time, base64, struct, logging, subprocess, threading, urllib.request, urllib.parse
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, TypedDict
 
 log = logging.getLogger("llamagui.engine")
 
@@ -15,14 +19,100 @@ except ImportError:
 
 import config
 
+
+# ── ProfileDict & helpers (DD-012 #7) ────────────────────────────────────────
+# Single source of truth for all profile key names and their canonical defaults.
+# Use _p(profile, "key") everywhere inside engine code instead of
+# profile.get("key", some_literal) — this makes key names statically greppable
+# and their defaults centralised in one place.
+
+class ProfileDict(TypedDict, total=False):
+    """Typed documentation for profile keys.
+
+    Declared as ``total=False`` so callers may supply any subset.
+    Not used as a runtime annotation on variables — kept as documentation only.
+    """
+    model_path:          str
+    mmproj_path:         str
+    n_gpu_layers:        int
+    n_ctx:               int
+    n_batch:             int
+    n_threads:           int
+    chat_format:         str
+    engine_mode:         str
+    verbose:             bool
+    draft_model_path:    str
+    fallback_gpu_layers: list
+    temperature:         float
+    top_p:               float
+    top_k:               int
+    repeat_penalty:      float
+    max_tokens:          int
+    stop:                object   # str | list[str] | None
+    seed:                int
+    presence_penalty:    float
+    frequency_penalty:   float
+    logprobs:            bool
+    top_logprobs:        int
+    tools:               list     # list[dict] | None
+    tool_choice:         object   # str | dict | None
+    id_slot:             int
+    response_format:     dict
+
+
+# Canonical defaults — one place, no scattered literals
+_PROFILE_DEFAULTS: dict[str, Any] = {
+    "model_path":          "",
+    "mmproj_path":         "",
+    "n_gpu_layers":        35,
+    "n_ctx":               4096,
+    "n_batch":             512,
+    "n_threads":           0,
+    "chat_format":         "chatml",
+    "engine_mode":         "subprocess",
+    "verbose":             False,
+    "draft_model_path":    "",
+    "fallback_gpu_layers": [35, 20, 10, 0],
+    "temperature":         0.7,
+    "top_p":               0.9,
+    "top_k":               40,
+    "repeat_penalty":      1.1,
+    "max_tokens":          2048,
+    "stop":                None,
+    "seed":                None,
+    "presence_penalty":    None,
+    "frequency_penalty":   None,
+    "logprobs":            None,
+    "top_logprobs":        None,
+    "tools":               None,
+    "tool_choice":         None,
+    "id_slot":             None,
+    "response_format":     None,
+}
+
+
+def _p(profile: dict, key: str, fallback: Any = None) -> Any:
+    """Read *key* from *profile* with canonical default.
+
+    Priority: profile[key] > _PROFILE_DEFAULTS[key] > fallback
+    Replaces all ``profile.get("key", hardcoded_literal)`` call sites.
+    """
+    val = profile.get(key)
+    if val is not None:
+        return val
+    default = _PROFILE_DEFAULTS.get(key)
+    if default is not None:
+        return default
+    return fallback
+
+
 # ── GGUF metadata reader ─────────────────────────────────────────────────────
 GGUF_MAGIC = b"GGUF"
 
-# Architecture names that indicate a VLM (vision-language model)
 _VLM_ARCHITECTURES = frozenset({
     "llava", "llava_next", "llava_next_video",
     "qwen2_vl", "qwen2_5_vl", "qwen3_vl",
-    "gemma3", "gemma3_text",          # gemma3 multimodal variant
+    "gemma3", "gemma3_text",
     "internvl", "internvl2",
     "phi3v", "phi4mm",
     "pixtral", "mistral3",
@@ -38,9 +128,9 @@ def read_gguf_metadata(path: str) -> dict:
         with open(path, "rb") as f:
             if f.read(4) != GGUF_MAGIC:
                 return result
-            version = struct.unpack("<I", f.read(4))[0]
+            version      = struct.unpack("<I", f.read(4))[0]
             tensor_count = struct.unpack("<Q", f.read(8))[0]
-            kv_count    = struct.unpack("<Q", f.read(8))[0]
+            kv_count     = struct.unpack("<Q", f.read(8))[0]
 
             def read_str():
                 n = struct.unpack("<Q", f.read(8))[0]
@@ -75,10 +165,10 @@ def read_gguf_metadata(path: str) -> dict:
                     break
 
         arch = result.get("general.architecture", "")
-        result["architecture"]    = arch
-        result["model_name"]      = result.get("general.name", "")
+        result["architecture"]     = arch
+        result["model_name"]       = result.get("general.name", "")
         ctx  = result.get(f"{arch}.context_length",  result.get("llama.context_length",  0))
-        result["context_length"]  = ctx
+        result["context_length"]   = ctx
         emb  = result.get(f"{arch}.embedding_length", result.get("llama.embedding_length", 0))
         result["embedding_length"] = emb
         layers = result.get(f"{arch}.block_count",   result.get("llama.block_count", 0))
@@ -97,8 +187,7 @@ def read_gguf_metadata(path: str) -> dict:
         params = (n_layer * n_embd * n_embd * 4 + n_vocab * n_embd * 2) / 1e9
         result["n_params_b"]    = round(params, 2)
         result["chat_template"] = result.get("tokenizer.chat_template", "")
-        # DD-011: 從 architecture 欄位判斷模型是否具備視覺能力
-        result["has_vision"] = arch.lower() in _VLM_ARCHITECTURES
+        result["has_vision"]    = arch.lower() in _VLM_ARCHITECTURES
     except Exception:
         pass
     return result
@@ -116,14 +205,14 @@ def detect_chat_format(model_path: str) -> str:
     elif "[inst]" in template:                                  fmt = "llama-2"
     elif "<|user|>" in template:                               fmt = "phi3"
     elif "\u2581<0x0a>" in template or "deepseek" in template: fmt = "deepseek"
-    elif "gemma"   in name:                                    fmt = "gemma"
-    elif "llama-3" in name or "llama3" in name:                fmt = "llama-3"
-    elif "llama-2" in name or "llama2" in name:                fmt = "llama-2"
-    elif "mistral" in name:                                    fmt = "mistral-instruct"
-    elif "qwen"    in name:                                    fmt = "qwen"
+    elif "gemma"    in name:                                   fmt = "gemma"
+    elif "llama-3"  in name or "llama3"  in name:              fmt = "llama-3"
+    elif "llama-2"  in name or "llama2"  in name:              fmt = "llama-2"
+    elif "mistral"  in name:                                   fmt = "mistral-instruct"
+    elif "qwen"     in name:                                   fmt = "qwen"
     elif "deepseek" in name:                                   fmt = "deepseek"
-    elif "phi"     in name:                                    fmt = "phi3"
-    elif "alpaca"  in name:                                    fmt = "alpaca"
+    elif "phi"      in name:                                   fmt = "phi3"
+    elif "alpaca"   in name:                                   fmt = "alpaca"
     else:                                                       fmt = "chatml"
 
     log.info(f"detect_chat_format: '{os.path.basename(model_path)}' → {fmt}")
@@ -218,36 +307,24 @@ def _find_model_by_name(model_name: str) -> str | None:
 
 # ── DD-011: mmproj auto-discovery ─────────────────────────────────────────────
 def _find_mmproj(model_path: str) -> str | None:
-    """
-    Search model directory for a matching mmproj file.
-    Priority:
-      1. Same prefix: {model_stem}-mmproj*.gguf  or  {model_stem}*mmproj*.gguf
-      2. Generic:     mmproj*.gguf  (only if exactly one found in directory)
-    Returns the absolute path string, or None if not found.
-    """
     model_dir  = os.path.dirname(os.path.abspath(model_path))
     model_stem = os.path.splitext(os.path.basename(model_path))[0].lower()
     try:
         all_files = [f for f in os.listdir(model_dir) if f.lower().endswith(".gguf")]
     except OSError:
         return None
-
-    # Priority 1: stem-based match
     stem_matches = [
         f for f in all_files
         if "mmproj" in f.lower() and (
-            f.lower().startswith(model_stem[:12])   # prefix match (12 chars tolerance)
-            or model_stem[:8] in f.lower()           # looser prefix
+            f.lower().startswith(model_stem[:12])
+            or model_stem[:8] in f.lower()
         )
     ]
     if stem_matches:
         return os.path.join(model_dir, sorted(stem_matches)[0])
-
-    # Priority 2: generic mmproj (only if unique)
     generic = [f for f in all_files if "mmproj" in f.lower()]
     if len(generic) == 1:
         return os.path.join(model_dir, generic[0])
-
     return None
 
 
@@ -296,7 +373,7 @@ class SubprocessEngine:
         self.stats            = EngineStats()
         self.current_profile: dict  = {}
         self._load_at:        float = 0.0
-        self._has_vision:     bool  = False   # DD-011
+        self._has_vision:     bool  = False
 
     @staticmethod
     def find_server_exe() -> str | None:
@@ -325,7 +402,6 @@ class SubprocessEngine:
                 time.sleep(0.4)
         return False
 
-    # DD-011: query llama-server /props to get vision capability flag
     def _query_vision_capable(self) -> bool:
         try:
             with urllib.request.urlopen(self._server_url("/props"), timeout=2) as resp:
@@ -337,7 +413,7 @@ class SubprocessEngine:
     def load(self, profile: dict) -> tuple[bool, str]:
         exe = self.find_server_exe()
         if not exe: return False, "llama-server.exe not found — see bin/cuda/"
-        model_path = profile.get("model_path", "")
+        model_path = _p(profile, "model_path")
         if not model_path or not os.path.isfile(model_path):
             return False, f"model file not found: {model_path}"
         t_start = time.perf_counter()
@@ -346,8 +422,7 @@ class SubprocessEngine:
             meta = read_gguf_metadata(model_path)
             self.stats.model_metadata = meta
 
-            # DD-011: mmproj auto-discovery
-            mmproj = profile.get("mmproj_path", "")
+            mmproj = _p(profile, "mmproj_path")
             if not mmproj or not os.path.isfile(mmproj):
                 discovered = _find_mmproj(model_path)
                 if discovered:
@@ -356,20 +431,19 @@ class SubprocessEngine:
 
             cmd = [exe, "--model", model_path, "--host", self.SERVER_HOST,
                    "--port",         str(self.SERVER_PORT),
-                   "--n-gpu-layers", str(profile.get("n_gpu_layers", 35)),
-                   "--ctx-size",     str(profile.get("n_ctx", 4096)),
-                   "--batch-size",   str(profile.get("n_batch", 512)),
-                   "--chat-template", str(profile.get("chat_format", "chatml")),
+                   "--n-gpu-layers", str(_p(profile, "n_gpu_layers")),
+                   "--ctx-size",     str(_p(profile, "n_ctx")),
+                   "--batch-size",   str(_p(profile, "n_batch")),
+                   "--chat-template", str(_p(profile, "chat_format")),
                    "--no-mmap",
                    ]
             if mmproj and os.path.isfile(mmproj):
                 cmd += ["--mmproj", mmproj]
                 log.info(f"Loading with mmproj: {os.path.basename(mmproj)}")
-
-            # DD-001: speculative decoding draft model
-            draft = profile.get("draft_model_path", "")
+            draft = _p(profile, "draft_model_path")
             if draft and os.path.isfile(draft): cmd += ["--draft-model", draft]
-            if not profile.get("verbose", False): cmd += ["--log-disable"]
+            if not _p(profile, "verbose"): cmd += ["--log-disable"]
+
             try:
                 self.proc = subprocess.Popen(
                     cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -380,20 +454,18 @@ class SubprocessEngine:
                 self._stop_server()
                 return False, "llama-server did not become ready within 60s"
 
-            # DD-011: query vision capability after server is ready
             self._has_vision = self._query_vision_capable()
             if not self._has_vision:
-                # fallback: check metadata architecture or mmproj presence
                 self._has_vision = (
                     meta.get("has_vision", False)
                     or (bool(mmproj) and os.path.isfile(mmproj))
                 )
 
-            self.current_profile     = profile.copy()
-            self.current_profile["mmproj_path"] = mmproj  # store resolved mmproj path
+            self.current_profile                = profile.copy()
+            self.current_profile["mmproj_path"] = mmproj
             self.stats.model_name    = os.path.basename(model_path)
             self.stats.engine_mode   = "subprocess"
-            self.stats.context_max   = profile.get("n_ctx", 4096)
+            self.stats.context_max   = _p(profile, "n_ctx")
             self.stats.load_time_sec = time.perf_counter() - t_start
             self._load_at            = time.time()
             vision_tag = " [vision]" if self._has_vision else ""
@@ -423,23 +495,32 @@ class SubprocessEngine:
         body: dict[str, Any] = {
             "model":          "local",
             "messages":       _encode_multimodal_messages(messages),
-            "temperature":    profile.get("temperature", 0.7),
-            "top_p":          profile.get("top_p", 0.9),
-            "top_k":          profile.get("top_k", 40),
-            "repeat_penalty": profile.get("repeat_penalty", 1.1),
-            "max_tokens":     profile.get("max_tokens", 2048),
+            "temperature":    _p(profile, "temperature"),
+            "top_p":          _p(profile, "top_p"),
+            "top_k":          _p(profile, "top_k"),
+            "repeat_penalty": _p(profile, "repeat_penalty"),
+            "max_tokens":     _p(profile, "max_tokens"),
             "stream":         True,
         }
-        if response_format:                              body["response_format"]    = response_format
-        if profile.get("stop")              is not None: body["stop"]              = profile["stop"]
-        if profile.get("seed")              is not None: body["seed"]              = profile["seed"]
-        if profile.get("presence_penalty")  is not None: body["presence_penalty"]  = profile["presence_penalty"]
-        if profile.get("frequency_penalty") is not None: body["frequency_penalty"] = profile["frequency_penalty"]
-        if profile.get("logprobs")          is not None: body["logprobs"]          = profile["logprobs"]
-        if profile.get("top_logprobs")      is not None: body["top_logprobs"]      = profile["top_logprobs"]
-        if profile.get("tools")       is not None: body["tools"]       = profile["tools"]
-        if profile.get("tool_choice") is not None: body["tool_choice"] = profile["tool_choice"]
-        if profile.get("id_slot") is not None: body["id_slot"] = profile["id_slot"]
+        if response_format:                                    body["response_format"]   = response_format
+        v = _p(profile, "stop");             
+        if v is not None:                                      body["stop"]              = v
+        v = _p(profile, "seed");             
+        if v is not None:                                      body["seed"]              = v
+        v = _p(profile, "presence_penalty"); 
+        if v is not None:                                      body["presence_penalty"]  = v
+        v = _p(profile, "frequency_penalty");
+        if v is not None:                                      body["frequency_penalty"] = v
+        v = _p(profile, "logprobs");         
+        if v is not None:                                      body["logprobs"]          = v
+        v = _p(profile, "top_logprobs");     
+        if v is not None:                                      body["top_logprobs"]      = v
+        v = _p(profile, "tools");            
+        if v is not None:                                      body["tools"]             = v
+        v = _p(profile, "tool_choice");      
+        if v is not None:                                      body["tool_choice"]       = v
+        v = _p(profile, "id_slot");          
+        if v is not None:                                      body["id_slot"]           = v
 
         payload = json.dumps(body).encode()
         req = urllib.request.Request(
@@ -462,12 +543,8 @@ class SubprocessEngine:
                     except (json.JSONDecodeError, KeyError): continue
         except Exception as e:
             import traceback
-            log.error(
-                f"SubprocessEngine.stream() failed\n"
-                f"  Model:  {self.stats.model_name}\n"
-                f"  Error:  {type(e).__name__}: {e}\n"
-                f"  Trace:\n{traceback.format_exc()}"
-            )
+            log.error(f"SubprocessEngine.stream() failed | model={self.stats.model_name} | "
+                      f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
             yield f"[Error: {e}]"
         finally:
             elapsed = time.perf_counter() - t0
@@ -476,11 +553,9 @@ class SubprocessEngine:
             self.stats.elapsed_sec       = elapsed
             self.stats.tokens_per_sec    = count / elapsed if elapsed > 0 else 0
             self.stats.context_used      = prompt_tokens + count
-            log.info(
-                f"stream() done | model={self.stats.model_name} | tokens={count}"
-                f" | tps={self.stats.tokens_per_sec:.1f} | elapsed={elapsed:.2f}s"
-                f" | prompt_tokens={prompt_tokens}"
-            )
+            log.info(f"stream() done | model={self.stats.model_name} | tokens={count}"
+                     f" | tps={self.stats.tokens_per_sec:.1f} | elapsed={elapsed:.2f}s"
+                     f" | prompt_tokens={prompt_tokens}")
 
     def embed(self, input_texts: list[str]) -> list[list[float]]:
         if not self.is_loaded: raise RuntimeError("No model loaded")
@@ -510,7 +585,7 @@ class BindingEngine:
 
     def load(self, profile: dict) -> tuple[bool, str]:
         if not BINDING_AVAILABLE: return False, "llama-cpp-python not installed — use subprocess mode"
-        model_path = profile.get("model_path", "")
+        model_path = _p(profile, "model_path")
         if not model_path or not os.path.isfile(model_path):
             return False, f"model file not found: {model_path}"
         t_start = time.perf_counter()
@@ -520,8 +595,7 @@ class BindingEngine:
                 meta = read_gguf_metadata(model_path)
                 self.stats.model_metadata = meta
 
-                # DD-011: mmproj auto-discovery for binding mode
-                mmproj = profile.get("mmproj_path", "")
+                mmproj = _p(profile, "mmproj_path")
                 if not mmproj or not os.path.isfile(mmproj):
                     discovered = _find_mmproj(model_path)
                     if discovered:
@@ -530,11 +604,11 @@ class BindingEngine:
 
                 kwargs = dict(
                     model_path=model_path,
-                    n_gpu_layers=profile.get("n_gpu_layers", 35),
-                    n_ctx=profile.get("n_ctx", 4096),
-                    n_batch=profile.get("n_batch", 512),
-                    chat_format=profile.get("chat_format", "chatml"),
-                    verbose=profile.get("verbose", False),
+                    n_gpu_layers=_p(profile, "n_gpu_layers"),
+                    n_ctx=_p(profile, "n_ctx"),
+                    n_batch=_p(profile, "n_batch"),
+                    chat_format=_p(profile, "chat_format"),
+                    verbose=_p(profile, "verbose"),
                     embedding=True)
                 if mmproj and os.path.isfile(mmproj):
                     handler = _build_clip_handler(mmproj)
@@ -543,11 +617,11 @@ class BindingEngine:
                         log.info(f"LLaVA handler set for: {os.path.basename(mmproj)}")
 
                 self.llm = _Llama(**kwargs)
-                self.current_profile     = profile.copy()
+                self.current_profile                = profile.copy()
                 self.current_profile["mmproj_path"] = mmproj
                 self.stats.model_name    = os.path.basename(model_path)
                 self.stats.engine_mode   = "binding"
-                self.stats.context_max   = profile.get("n_ctx", 4096)
+                self.stats.context_max   = _p(profile, "n_ctx")
                 self.stats.load_time_sec = time.perf_counter() - t_start
                 self._load_at            = time.time()
                 has_vision = self.llm.chat_handler is not None
@@ -568,7 +642,6 @@ class BindingEngine:
     @property
     def is_loaded(self) -> bool: return self.llm is not None
 
-    # DD-011: binding mode vision check
     @property
     def has_vision(self) -> bool:
         if not self.is_loaded: return False
@@ -580,22 +653,30 @@ class BindingEngine:
         t0 = time.perf_counter(); count = 0
         kwargs: dict[str, Any] = dict(
             messages=messages,
-            temperature=profile.get("temperature", 0.7),
-            top_p=profile.get("top_p", 0.9),
-            top_k=profile.get("top_k", 40),
-            repeat_penalty=profile.get("repeat_penalty", 1.1),
-            max_tokens=profile.get("max_tokens", 2048),
+            temperature=_p(profile, "temperature"),
+            top_p=_p(profile, "top_p"),
+            top_k=_p(profile, "top_k"),
+            repeat_penalty=_p(profile, "repeat_penalty"),
+            max_tokens=_p(profile, "max_tokens"),
             stream=True,
         )
-        if response_format:                                    kwargs["response_format"]    = response_format
-        if profile.get("stop")              is not None: kwargs["stop"]              = profile["stop"]
-        if profile.get("seed")              is not None: kwargs["seed"]              = profile["seed"]
-        if profile.get("presence_penalty")  is not None: kwargs["presence_penalty"]  = profile["presence_penalty"]
-        if profile.get("frequency_penalty") is not None: kwargs["frequency_penalty"] = profile["frequency_penalty"]
-        if profile.get("logprobs")          is not None: kwargs["logprobs"]          = profile["logprobs"]
-        if profile.get("top_logprobs")      is not None: kwargs["top_logprobs"]      = profile["top_logprobs"]
-        if profile.get("tools")       is not None: kwargs["tools"]       = profile["tools"]
-        if profile.get("tool_choice") is not None: kwargs["tool_choice"] = profile["tool_choice"]
+        if response_format:                                    kwargs["response_format"]   = response_format
+        v = _p(profile, "stop");             
+        if v is not None:                                      kwargs["stop"]              = v
+        v = _p(profile, "seed");             
+        if v is not None:                                      kwargs["seed"]              = v
+        v = _p(profile, "presence_penalty"); 
+        if v is not None:                                      kwargs["presence_penalty"]  = v
+        v = _p(profile, "frequency_penalty");
+        if v is not None:                                      kwargs["frequency_penalty"] = v
+        v = _p(profile, "logprobs");         
+        if v is not None:                                      kwargs["logprobs"]          = v
+        v = _p(profile, "top_logprobs");     
+        if v is not None:                                      kwargs["top_logprobs"]      = v
+        v = _p(profile, "tools");            
+        if v is not None:                                      kwargs["tools"]             = v
+        v = _p(profile, "tool_choice");      
+        if v is not None:                                      kwargs["tool_choice"]       = v
 
         prompt_tokens = 0
         try:
@@ -606,12 +687,8 @@ class BindingEngine:
                 if token: count += 1; yield token
         except Exception as e:
             import traceback
-            log.error(
-                f"BindingEngine.stream() failed\n"
-                f"  Model:  {self.stats.model_name}\n"
-                f"  Error:  {type(e).__name__}: {e}\n"
-                f"  Trace:\n{traceback.format_exc()}"
-            )
+            log.error(f"BindingEngine.stream() failed | model={self.stats.model_name} | "
+                      f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
             yield f"[Error: {e}]"
         finally:
             elapsed = time.perf_counter() - t0
@@ -619,11 +696,9 @@ class BindingEngine:
             self.stats.elapsed_sec       = elapsed
             self.stats.tokens_per_sec    = count / elapsed if elapsed > 0 else 0
             self.stats.context_used      = prompt_tokens + count
-            log.info(
-                f"stream() done | model={self.stats.model_name} | tokens={count}"
-                f" | tps={self.stats.tokens_per_sec:.1f} | elapsed={elapsed:.2f}s"
-                f" | prompt_tokens={prompt_tokens}"
-            )
+            log.info(f"stream() done | model={self.stats.model_name} | tokens={count}"
+                     f" | tps={self.stats.tokens_per_sec:.1f} | elapsed={elapsed:.2f}s"
+                     f" | prompt_tokens={prompt_tokens}")
 
     def embed(self, input_texts: list[str]) -> list[list[float]]:
         if not self.is_loaded: raise RuntimeError("No model loaded")
@@ -637,26 +712,17 @@ class BindingEngine:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _encode_multimodal_messages(messages: list[dict]) -> list[dict]:
-    """
-    DD-011: Preserve list-type content (ContentParts) for multimodal messages.
-    String content is passed through unchanged.
-    Pydantic models are serialised to dict before reaching here via api.py.
-    """
     result = []
     for m in messages:
         content = m.get("content", "")
-        # list content = multimodal parts, pass through as-is for llama-server
         if isinstance(content, list):
             serialised = []
             for part in content:
                 if isinstance(part, dict):
                     serialised.append(part)
                 else:
-                    # Pydantic model → dict (fallback)
-                    try:
-                        serialised.append(part.model_dump(exclude_none=True))
-                    except AttributeError:
-                        serialised.append({"type": "text", "text": str(part)})
+                    try:    serialised.append(part.model_dump(exclude_none=True))
+                    except AttributeError: serialised.append({"type": "text", "text": str(part)})
             result.append({"role": m["role"], "content": serialised})
         else:
             result.append({"role": m["role"], "content": content})
@@ -754,20 +820,19 @@ class LlamaEngine:
         self._switch_lock      = threading.Lock()
         self._waiting:     int  = 0
         self._waiting_lock       = threading.Lock()
+        self._is_loading:  bool = False            # DD-012 #5: loading state flag
+        self._loading_lock       = threading.Lock()
 
-    # DD-011: unified has_vision property
     @property
     def has_vision(self) -> bool:
-        if isinstance(self.active, SubprocessEngine):
-            return self.active._has_vision
-        if isinstance(self.active, BindingEngine):
-            return self.active.has_vision
+        if isinstance(self.active, SubprocessEngine): return self.active._has_vision
+        if isinstance(self.active, BindingEngine):    return self.active.has_vision
         return False
 
     def _resolve_chat_format(self, profile: dict) -> dict:
-        fmt = profile.get("chat_format", "").strip()
+        fmt = str(_p(profile, "chat_format", "")).strip()
         if not fmt or fmt == "auto":
-            model_path = profile.get("model_path", "")
+            model_path = _p(profile, "model_path")
             fmt = detect_chat_format(model_path) if (model_path and os.path.isfile(model_path)) else "chatml"
         return {**profile, "chat_format": fmt}
 
@@ -809,7 +874,6 @@ class LlamaEngine:
         import config as _cfg
         while not self._idle_stop_ev.wait(timeout=30):
             try:
-                # DD-009: subprocess process crash detection
                 if isinstance(self.active, SubprocessEngine) and self.active.proc is not None:
                     if self.active.proc.poll() is not None:
                         log.error(
@@ -819,6 +883,7 @@ class LlamaEngine:
                         )
                         with self.active.lock:
                             self.active._stop_server()
+                        self._current_profile = {}  # BUG-FIX #6
                         continue
 
                 s = _cfg.get_global_settings()
@@ -840,13 +905,25 @@ class LlamaEngine:
     def stop_idle_monitor(self) -> None: self._idle_stop_ev.set()
 
     def load(self, profile: dict | None = None) -> tuple[bool, str]:
+        # DD-012 #5: reject concurrent load attempts
+        with self._loading_lock:
+            if self._is_loading:
+                return False, "model is currently loading — wait for it to finish"
+            self._is_loading = True
+        try:
+            return self._load_internal(profile)
+        finally:
+            with self._loading_lock:
+                self._is_loading = False
+
+    def _load_internal(self, profile: dict | None = None) -> tuple[bool, str]:
         p       = self._resolve_chat_format(profile or config.get_profile())
         backend = self._pick_backend(p)
         if backend is not self.active and self.active.is_loaded: self.active.unload()
         self.active = backend
 
-        fallback_layers: list[int] = p.get("fallback_gpu_layers", [35, 20, 10, 0])
-        current_layers = p.get("n_gpu_layers", 35)
+        fallback_layers: list[int] = _p(p, "fallback_gpu_layers", [35, 20, 10, 0])
+        current_layers = _p(p, "n_gpu_layers")
         layers_to_try  = [current_layers] + [l for l in fallback_layers if l != current_layers]
 
         last_ok, last_msg = False, ""
@@ -870,7 +947,7 @@ class LlamaEngine:
         msg = self.active.unload(); self._current_profile = {}; return msg
 
     def _pick_backend(self, profile: dict):
-        if profile.get("engine_mode") == "binding" and BINDING_AVAILABLE: return self.bind
+        if _p(profile, "engine_mode") == "binding" and BINDING_AVAILABLE: return self.bind
         return self.sub
 
     @property
@@ -878,14 +955,14 @@ class LlamaEngine:
     @property
     def is_loaded(self) -> bool: return self.active.is_loaded
     @property
+    def is_loading(self) -> bool: return self._is_loading   # DD-012 #5
+    @property
     def stats(self): return self.active.stats
 
     def _check_queue(self) -> bool:
         with self._waiting_lock:
-            if self._waiting >= MAX_WAITING:
-                return False
-            self._waiting += 1
-            return True
+            if self._waiting >= MAX_WAITING: return False
+            self._waiting += 1; return True
 
     def _release_queue(self) -> None:
         with self._waiting_lock:
@@ -896,8 +973,7 @@ class LlamaEngine:
         self.touch()
         p = profile or self.current_profile
         if not self._check_queue():
-            yield f"[Error: server busy — too many pending requests (max {MAX_WAITING})]"
-            return
+            yield f"[Error: server busy — too many pending requests (max {MAX_WAITING})]"; return
         acquired = self._req_lock.acquire(timeout=QUEUE_TIMEOUT_SEC)
         if not acquired:
             self._release_queue()
@@ -910,6 +986,11 @@ class LlamaEngine:
 
     def generate(self, messages: list[dict], profile: dict | None = None,
                  response_format: dict | None = None) -> str:
+        """
+        Full-response wrapper. Queue guard lives here only.
+        BUG-FIX #1: calls self.active.stream() directly, NOT self.stream(),
+        to avoid double _check_queue / _release_queue counting.
+        """
         self.touch()
         p = profile or self.current_profile
         if not self._check_queue():
@@ -922,24 +1003,16 @@ class LlamaEngine:
             result = "".join(self.active.stream(messages, p, response_format))
             if result.startswith("[Error:"):
                 import traceback
-                log.error(
-                    f"generate() failed\n"
-                    f"  Model:  {self.stats.model_name}\n"
-                    f"  Error:  {result}\n"
-                    f"  Trace:\n{''.join(traceback.format_stack())}"
-                )
+                log.error(f"generate() failed | model={self.stats.model_name} | {result}\n"
+                          f"{''.join(traceback.format_stack())}")
                 raise RuntimeError(result)
             return result
         except (TimeoutError, RuntimeError):
             raise
         except Exception as e:
             import traceback
-            log.error(
-                f"generate() failed\n"
-                f"  Model:  {self.stats.model_name}\n"
-                f"  Error:  {type(e).__name__}: {e}\n"
-                f"  Trace:\n{traceback.format_exc()}"
-            )
+            log.error(f"generate() failed | model={self.stats.model_name} | "
+                      f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
             raise
         finally:
             self._req_lock.release()
@@ -955,9 +1028,8 @@ class LlamaEngine:
         load_at = getattr(self.active, "_load_at", 0.0)
         vram    = get_vram_info()
         return {
-            "name":  s.model_name, "model": s.model_name,
-            "size":  s.model_metadata.get("file_size_gb", 0),
-            "digest": "",
+            "name": s.model_name, "model": s.model_name,
+            "size": s.model_metadata.get("file_size_gb", 0), "digest": "",
             "details": {
                 "format":             "gguf",
                 "family":             s.model_metadata.get("architecture", ""),
@@ -971,7 +1043,6 @@ class LlamaEngine:
             "loaded_at":     int(load_at),
             "size_vram":     vram.get("used_mb", 0),
             "expires_at":    "",
-            # DD-011: vision capability flag
             "has_vision":    self.has_vision,
         }
 
@@ -980,11 +1051,11 @@ class LlamaEngine:
     def get_context_usage(self) -> tuple[int, int]:
         s = self.active.stats; return s.context_used, s.context_max
     def format_prompt_preview(self, messages: list[dict]) -> str:
-        fmt = self.current_profile.get("chat_format", "chatml")
+        fmt = _p(self.current_profile, "chat_format", "chatml")
         return format_prompt_preview(messages, fmt)
 
 
 # ── Module-level singleton ────────────────────────────────────────────────────
 engine = LlamaEngine()
 engine.start_idle_monitor()
-find_model_by_name = _find_model_by_name  # expose for api.py
+find_model_by_name = _find_model_by_name

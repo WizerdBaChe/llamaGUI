@@ -1,4 +1,4 @@
-# api.py v2.6 ── FastAPI REST 端點
+# api.py v2.6.2 ── FastAPI REST 端點
 from __future__ import annotations
 import os, time, json, uuid, threading
 from typing import Any, AsyncIterator, Literal
@@ -12,16 +12,15 @@ import logging
 import config
 import engine as eng
 
-app = FastAPI(title="LlamaGUI API", version="2.6.0")
+app = FastAPI(title="LlamaGUI API", version="2.6.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
-# ── Logger 設定 ───────────────────────────────────────────────────────────────
+# ── Logger ────────────────────────────────────────────────────────────────────
 _log_path = config.ROOT / "logs" / "api.log"
 _log_path.parent.mkdir(parents=True, exist_ok=True)
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -32,21 +31,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("llamagui.api")
 
-# ── 全域 exception handler ────────────────────────────────────────────────────
+# ── Exception handler ─────────────────────────────────────────────────────────
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
     import traceback
     tb = traceback.format_exc()
-    logger.error(
-        f"Unhandled exception\n"
-        f"  Path:  {request.method} {request.url}\n"
-        f"  Error: {type(exc).__name__}: {exc}\n"
-        f"  Trace:\n{tb}"
-    )
-    return JSONResponse(
-        status_code=500,
-        content={"detail": f"{type(exc).__name__}: {exc}"}
-    )
+    logger.error(f"Unhandled exception\n  Path: {request.method} {request.url}\n"
+                 f"  Error: {type(exc).__name__}: {exc}\n  Trace:\n{tb}")
+    return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
 
 # ── Request log middleware ────────────────────────────────────────────────────
 @app.middleware("http")
@@ -56,12 +48,10 @@ async def log_requests(request: Request, call_next):
     response = await call_next(request)
     elapsed  = (_time.time() - start) * 1000
     level    = logging.WARNING if response.status_code >= 400 else logging.INFO
-    logger.log(level,
-               f"{request.method} {request.url.path} "
-               f"→ {response.status_code} ({elapsed:.1f}ms)")
+    logger.log(level, f"{request.method} {request.url.path} → {response.status_code} ({elapsed:.1f}ms)")
     return response
 
-# ── DD-011: Pydantic ContentPart 型別宣告 ─────────────────────────────────────
+# ── DD-011: ContentPart Pydantic models ───────────────────────────────────────
 class ImageURL(BaseModel):
     url:    str
     detail: Literal["auto", "low", "high"] = "auto"
@@ -76,24 +66,20 @@ class ContentPartImage(BaseModel):
 
 class Message(BaseModel):
     role:    str
-    # content 支援純文字或多模態 parts（OpenAI content parts 格式）
     content: str | list[ContentPartText | ContentPartImage]
 
     def to_dict(self) -> dict:
-        """序列化為 engine 可用的 dict，list content 轉為可 JSON 化的 dict list。"""
         if isinstance(self.content, str):
             return {"role": self.role, "content": self.content}
-        return {
-            "role": self.role,
-            "content": [p.model_dump(exclude_none=True) for p in self.content],
-        }
+        return {"role": self.role,
+                "content": [p.model_dump(exclude_none=True) for p in self.content]}
 
     def has_images(self) -> bool:
         if isinstance(self.content, list):
             return any(p.type == "image_url" for p in self.content)
         return False
 
-# ── 其他 Pydantic models ──────────────────────────────────────────────────────
+# ── Pydantic models ───────────────────────────────────────────────────────────
 class ResponseFormat(BaseModel):
     type:        str       = "text"
     json_schema: dict | None = None
@@ -108,17 +94,14 @@ class ChatRequest(BaseModel):
     max_tokens:     int   = Field(default=2048, ge=1)
     stream:         bool  = False
     response_format: ResponseFormat | None = None
-    # DD-007
     stop:              list[str] | str | None = None
     seed:              int | None             = None
     presence_penalty:  float | None          = None
     frequency_penalty: float | None          = None
     logprobs:          bool | None           = None
     top_logprobs:      int | None            = None
-    # DD-008
     tools:       list[dict] | None       = None
     tool_choice: str | dict | None       = None
-    # DD-002
     id_slot:     int | None              = None
 
 class CompletionRequest(BaseModel):
@@ -151,11 +134,30 @@ class LoadRequest(BaseModel):
     max_tokens:     int | None   = None
     chat_format:    str | None   = None
     engine_mode:    str | None   = None
-    draft_model_path: str | None = None  # DD-001
+    draft_model_path: str | None = None
+
+class ProfileData(BaseModel):
+    """DD-012 #4: typed profile schema — unknown keys are still allowed (extra='allow')
+    to maintain backward compatibility with custom profile fields."""
+    model_config = {"extra": "allow"}
+    model_path:       str   = ""
+    mmproj_path:      str   = ""
+    n_gpu_layers:     int   = 35
+    n_ctx:            int   = 4096
+    n_batch:          int   = 512
+    temperature:      float = 0.7
+    top_p:            float = 0.9
+    top_k:            int   = 40
+    repeat_penalty:   float = 1.1
+    max_tokens:       int   = 2048
+    chat_format:      str   = "chatml"
+    engine_mode:      str   = "subprocess"
+    verbose:          bool  = False
+    draft_model_path: str   = ""
 
 class ProfileSaveRequest(BaseModel):
     name:    str
-    profile: dict[str, Any]
+    profile: ProfileData   # DD-012 #4: typed — unknown fields pass through via extra='allow'
 
 class PromptPreviewRequest(BaseModel):
     messages:    list[dict]
@@ -167,13 +169,18 @@ class HFDownloadRequest(BaseModel):
     repo_id:  str = ""
 
 _download_tasks: dict[str, dict] = {}
+_TASK_TTL_SEC = 3600  # BUG-FIX #8: completed tasks older than 1h are pruned
 
-# ── DD-011: vision guard helper ───────────────────────────────────────────────
+def _prune_download_tasks() -> None:
+    now = time.time()
+    stale = [tid for tid, t in _download_tasks.items()
+             if t.get("status") in ("done", "error", "cancelled")
+             and now - t.get("finished_at", now) > _TASK_TTL_SEC]
+    for tid in stale:
+        del _download_tasks[tid]
+
+# ── DD-011: vision guard ──────────────────────────────────────────────────────
 def _check_vision_request(req: ChatRequest) -> None:
-    """
-    如果任何 message 含有 image_url part，檢查當前模型是否具備視覺能力。
-    若不支援，直接 raise HTTPException 400，不讓請求流到 llama-server。
-    """
     has_image = any(m.has_images() for m in req.messages)
     if has_image and not eng.engine.has_vision:
         raise HTTPException(
@@ -191,9 +198,13 @@ def _check_vision_request(req: ChatRequest) -> None:
 # ═════════════════════════════════════════════════════════════════════════════
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": eng.engine.is_loaded,
-            "model_name": eng.engine.stats.model_name,
-            "has_vision": eng.engine.has_vision}   # DD-011
+    return {
+        "status":        "ok",
+        "model_loaded":  eng.engine.is_loaded,
+        "model_loading": eng.engine.is_loading,   # DD-012 #5
+        "model_name":    eng.engine.stats.model_name,
+        "has_vision":    eng.engine.has_vision,   # DD-011
+    }
 
 @app.get("/models")
 def list_models():
@@ -205,19 +216,16 @@ def list_models():
 def list_models_openai():
     files = config.scan_models()
     now   = int(time.time())
-    return {
-        "object": "list",
-        "data": [
-            {"id": os.path.splitext(os.path.basename(f))[0],
-             "object": "model", "created": now, "owned_by": "local"}
-            for f in files
-        ],
-    }
+    return {"object": "list",
+            "data": [{"id": os.path.splitext(os.path.basename(f))[0],
+                      "object": "model", "created": now, "owned_by": "local"}
+                     for f in files]}
 
 @app.post("/load")
 def load_model(req: LoadRequest):
+    if eng.engine.is_loading:                       # DD-012 #5
+        raise HTTPException(status_code=409, detail="model is currently loading — try again shortly")
     profile = config.get_profile(req.profile_name)
-
     if req.model_path:
         path = req.model_path
         if not os.path.isfile(path):
@@ -231,7 +239,6 @@ def load_model(req: LoadRequest):
                            f"Pass an absolute path or a name matching a .gguf in models/. "
                            f"Use GET /v1/models to list available models.")
         profile["model_path"] = path
-
     overrides = {
         "n_ctx": req.n_ctx, "n_gpu_layers": req.n_gpu_layers,
         "n_batch": req.n_batch, "n_threads": req.n_threads,
@@ -242,9 +249,7 @@ def load_model(req: LoadRequest):
         "draft_model_path": req.draft_model_path,
     }
     for k, v in overrides.items():
-        if v is not None:
-            profile[k] = v
-
+        if v is not None: profile[k] = v
     ok, msg = eng.engine.load(profile)
     if not ok:
         raise HTTPException(status_code=400, detail=msg)
@@ -304,19 +309,22 @@ def hf_download_start(req: HFDownloadRequest):
     task_id   = uuid.uuid4().hex[:8]
     cancel_ev = threading.Event()
     _download_tasks[task_id] = {"progress": 0, "total": 0, "status": "running",
-                                 "filename": req.filename, "cancel_event": cancel_ev, "message": ""}
+                                 "filename": req.filename, "cancel_event": cancel_ev,
+                                 "message": "", "finished_at": 0.0}
     def _run():
         def _cb(dl, tot):
             _download_tasks[task_id]["progress"] = dl
             _download_tasks[task_id]["total"]    = tot
         ok, msg = eng.hf_download(req.url, dest, _cb, cancel_ev)
-        _download_tasks[task_id]["status"]  = "done" if ok else "error"
-        _download_tasks[task_id]["message"] = msg
+        _download_tasks[task_id]["status"]      = "done" if ok else "error"
+        _download_tasks[task_id]["message"]     = msg
+        _download_tasks[task_id]["finished_at"] = time.time()  # BUG-FIX #8
     threading.Thread(target=_run, daemon=True).start()
     return {"task_id": task_id, "filename": req.filename}
 
 @app.get("/hf-download/{task_id}")
 def hf_download_progress(task_id: str):
+    _prune_download_tasks()  # BUG-FIX #8
     t = _download_tasks.get(task_id)
     if not t: raise HTTPException(status_code=404, detail="Task not found")
     total = t["total"]; prog = t["progress"]
@@ -328,7 +336,7 @@ def hf_download_progress(task_id: str):
 def hf_download_cancel(task_id: str):
     t = _download_tasks.get(task_id)
     if not t: raise HTTPException(status_code=404, detail="Task not found")
-    t["cancel_event"].set(); t["status"] = "cancelled"
+    t["cancel_event"].set(); t["status"] = "cancelled"; t["finished_at"] = time.time()
     return {"task_id": task_id, "status": "cancelled"}
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -345,7 +353,8 @@ def get_profile_api(name: str): return config.get_profile(name)
 
 @app.post("/profiles")
 def save_profile_api(req: ProfileSaveRequest):
-    config.save_profile(req.name, req.profile)
+    # DD-012 #4: ProfileData → plain dict (preserves extra fields via extra='allow')
+    config.save_profile(req.name, req.profile.model_dump())
     return {"status": "saved", "name": req.name}
 
 @app.delete("/profiles/{name}")
@@ -385,29 +394,23 @@ async def chat_completions(req: ChatRequest):
     elif not eng.engine.is_loaded:
         raise HTTPException(status_code=503, detail="No model loaded. POST /load first.")
 
-    # DD-011: vision guard — fail-fast before hitting llama-server
     _check_vision_request(req)
 
     profile_override: dict[str, Any] = {
         **eng.engine.current_profile,
-        "temperature":    req.temperature,
-        "top_p":          req.top_p,
-        "top_k":          req.top_k,
-        "repeat_penalty": req.repeat_penalty,
-        "max_tokens":     req.max_tokens,
+        "temperature": req.temperature, "top_p": req.top_p,
+        "top_k": req.top_k, "repeat_penalty": req.repeat_penalty,
+        "max_tokens": req.max_tokens,
     }
     for field in ("stop", "seed", "presence_penalty", "frequency_penalty",
                   "logprobs", "top_logprobs"):
         val = getattr(req, field)
-        if val is not None:
-            profile_override[field] = val
+        if val is not None: profile_override[field] = val
     if req.tools       is not None: profile_override["tools"]       = req.tools
     if req.tool_choice is not None: profile_override["tool_choice"] = req.tool_choice
-    if req.id_slot is not None: profile_override["id_slot"] = req.id_slot
+    if req.id_slot     is not None: profile_override["id_slot"]     = req.id_slot
 
-    # DD-011: serialise messages with full ContentPart support
-    messages = [m.to_dict() for m in req.messages]
-
+    messages      = [m.to_dict() for m in req.messages]
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
     rf_dict: dict | None = None
     if req.response_format:
@@ -417,12 +420,22 @@ async def chat_completions(req: ChatRequest):
         async def event_stream() -> AsyncIterator[str]:
             for token in eng.engine.stream(messages, profile_override, rf_dict):
                 is_err = token.startswith("[Error:")
-                chunk  = {"id": completion_id, "object": "chat.completion.chunk",
-                          "created": int(time.time()), "model": req.model,
-                          "choices": [{"index": 0, "delta": {"content": token},
-                                       "finish_reason": None}]}
+                if is_err:
+                    # BUG-FIX #3: SSE error in OpenAI-compatible format
+                    err_event = {
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": int(time.time()), "model": req.model,
+                        "choices": [],
+                        "error": {"message": token, "type": "engine_error", "code": 500},
+                    }
+                    yield f"data: {json.dumps(err_event)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                chunk = {"id": completion_id, "object": "chat.completion.chunk",
+                         "created": int(time.time()), "model": req.model,
+                         "choices": [{"index": 0, "delta": {"content": token},
+                                      "finish_reason": None}]}
                 yield f"data: {json.dumps(chunk)}\n\n"
-                if is_err: yield "data: [DONE]\n\n"; return
             end = {"id": completion_id, "object": "chat.completion.chunk",
                    "created": int(time.time()), "model": req.model,
                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
@@ -447,7 +460,7 @@ async def chat_completions(req: ChatRequest):
                       "total_tokens":      stats.get("prompt_tokens", 0) + stats.get("completion_tokens", 0)}}
 
 # ═════════════════════════════════════════════════════════════════════════════
-# DD-003: OpenAI-compatible text completions (non-chat)
+# DD-003: /v1/completions
 # ═════════════════════════════════════════════════════════════════════════════
 @app.post("/v1/completions")
 async def text_completions(req: CompletionRequest):
@@ -464,14 +477,10 @@ async def text_completions(req: CompletionRequest):
     if eng.engine.active is eng.engine.sub:
         import urllib.request as _ur
         body: dict[str, Any] = {
-            "model":       "local",
-            "prompt":      req.prompt,
-            "max_tokens":  req.max_tokens,
-            "temperature": req.temperature,
-            "top_p":       req.top_p,
-            "top_k":       req.top_k,
-            "stream":      req.stream,
-            "echo":        req.echo,
+            "model": "local", "prompt": req.prompt,
+            "max_tokens": req.max_tokens, "temperature": req.temperature,
+            "top_p": req.top_p, "top_k": req.top_k,
+            "stream": req.stream, "echo": req.echo,
         }
         if req.stop is not None: body["stop"] = req.stop
         if req.seed is not None: body["seed"] = req.seed
@@ -483,8 +492,7 @@ async def text_completions(req: CompletionRequest):
             async def _proxy_stream() -> AsyncIterator[str]:
                 try:
                     with _ur.urlopen(http_req, timeout=300) as resp:
-                        for raw in resp:
-                            yield raw.decode("utf-8")
+                        for raw in resp: yield raw.decode("utf-8")
                 except Exception as e:
                     yield f"data: {{\"error\": \"{e}\"}}\n\n"
                     yield "data: [DONE]\n\n"
@@ -511,8 +519,7 @@ async def text_completions(req: CompletionRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
     return {"id": completion_id, "object": "text_completion",
-            "created": int(time.time()), "model": req.model,
-            "choices": results,
+            "created": int(time.time()), "model": req.model, "choices": results,
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}}
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -530,7 +537,6 @@ async def create_embeddings(req: EmbeddingRequest):
     texts = [req.input] if isinstance(req.input, str) else req.input
     if not texts:
         raise HTTPException(status_code=400, detail="input must not be empty")
-
     try:
         vectors = eng.engine.embed(texts)
     except RuntimeError as e:
